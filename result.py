@@ -204,7 +204,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
         address = re.sub(r"<[^>]+>", "", address_html or "").strip() if address_html else None
         prefecture, city, district, chome_banchi = split_address(address or "")
 
-        # 交通 (first)
+        # Access / Transportation (first entry)
         access_html = _dd_after_dt("交通") or ""
         st1, line1, walk1 = parse_line_station_walk(access_html)
 
@@ -230,7 +230,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
         if m_size:
             size = float(m_size.group(1))
 
-        # 竣工日 → Year only
+        # Completion date → extract year only
         built_html = _dd_after_dt("竣工日") or ""
         year = None
         my = re.search(r"([0-9]{4})年", built_html)
@@ -238,7 +238,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
             year = int(my.group(1))
 
         # ---------- DETAIL TABLE ----------
-        # 規模構造
+        # Scale / Structure section
         structure_html = None
         try:
             structure_html = _dd_after_dt("規模構造")
@@ -260,7 +260,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
             if mb:
                 basement_floors = num_from_text(mb.group(1))
 
-        # 入居可能日 / 更新料 / 駐車場 / 方位 / その他費用 / 設備 / 備考 / 情報更新日 / 取引態様 / 保険
+        # Available from / Renewal fee / Parking / Orientation / Other fees / Equipment / Notes / Info updated / Transaction type / Insurance
         available_from = re.sub(r"<[^>]+>", "", _dd_after_dt("入居可能日") or "").strip() or None
         renewal_html = _dd_after_dt("更新料") or ""
         months_renewal = months_from_text(renewal_html)
@@ -322,7 +322,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
         except Exception:
             pass
 
-        # Interior (tab: 間取り・部屋)
+        # Interior (site tab label '間取り・部屋' – Floorplan/Rooms)
         ensure_click(page, "button[data-js-buildroom-slide-tab='floorplan']")
         try:
             page.wait_for_selector(".c-buildroom-slide__thumbs img", timeout=8000)
@@ -333,7 +333,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
         except PWTimeout:
             pass
 
-        # Exterior (tab: 外観・共用部・周辺)
+        # Exterior / Common areas / Neighborhood (site tab label '外観・共用部・周辺')
         if ensure_click(page, "button[data-js-buildroom-slide-tab='exterior']", timeout=8000):
             try:
                 page.wait_for_selector(".c-buildroom-slide__thumbs img", timeout=12000)
@@ -495,7 +495,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "create_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-        # mark newly built if "新築" flag shown near header
+        # Mark as newly built if the '新築' (newly built) flag appears n
         try:
             new_flag = "新築" in page.locator(".c-buildroom__summary-flag").inner_text()
             result["newly_built"] = y_or_n(new_flag)
