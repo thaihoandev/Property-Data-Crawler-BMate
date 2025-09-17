@@ -1,4 +1,3 @@
-# result.py
 import re
 import json
 import argparse
@@ -13,13 +12,16 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # -----------------------------
 JP_NUM = {"０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9"}
 
+
 def jpn_digits_to_ascii(s: str) -> str:
     return "".join(JP_NUM.get(ch, ch) for ch in s)
+
 
 def num_from_text(s: str) -> Optional[int]:
     s = jpn_digits_to_ascii(s)
     m = re.search(r"(-?\d+)", s)
     return int(m.group(1)) if m else None
+
 
 def money_from_text(s: str) -> Optional[int]:
     """Return integer amount in JPY if found (commas allowed)."""
@@ -29,13 +31,16 @@ def money_from_text(s: str) -> Optional[int]:
         return None
     return int(m.group(1).replace(",", ""))
 
+
 def months_from_text(s: str) -> Optional[float]:
     s = jpn_digits_to_ascii(s)
     m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ヶ月", s)
     return float(m.group(1)) if m else None
 
+
 def y_or_n(flag: bool) -> str:
     return "Y" if flag else "N"
+
 
 def split_address(addr: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Very best-effort parsing for JP address: Prefecture / Ward-city / District / Chome-Banchi"""
@@ -72,6 +77,7 @@ def split_address(addr: str) -> Tuple[Optional[str], Optional[str], Optional[str
 
     return prefecture, city, district, chome_banchi
 
+
 def parse_line_station_walk(html_block: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
     """Parse like: 'ＪＲ 総武線 錦糸町 徒歩9分'"""
     # remove tags
@@ -83,8 +89,6 @@ def parse_line_station_walk(html_block: str) -> Tuple[Optional[str], Optional[st
     if mw:
         walk = num_from_text(mw.group(1))
     # line and station – take the last word before 徒歩 as station, previous token as line
-    # examples often contain 'ＪＲ 総武線 錦糸町 徒歩9分'
-    # try to capture <line> <station>
     mls = re.search(r"(?:JR|ＪＲ)?\s*([^\s]+線)\s*([^\s]+)\s*徒歩", text)
     if mls:
         return mls.group(2), mls.group(1), walk
@@ -93,10 +97,11 @@ def parse_line_station_walk(html_block: str) -> Tuple[Optional[str], Optional[st
     if "徒歩" in toks:
         i = toks.index("徒歩")
         if i >= 2:
-            line = toks[i-2]
-            st = toks[i-1]
+            line = toks[i - 2]
+            st = toks[i - 1]
             return st, line, walk
     return None, None, walk
+
 
 def extract_features_map(equip_text: str) -> Dict[str, str]:
     t = equip_text or ""
@@ -117,6 +122,7 @@ def extract_features_map(equip_text: str) -> Dict[str, str]:
     }
     return {k: y_or_n(v) for k, v in flags.items()}
 
+
 def pick_lock_exchange(text: str) -> Optional[int]:
     """Find money for key/lock exchange only if present."""
     if not text:
@@ -124,6 +130,19 @@ def pick_lock_exchange(text: str) -> Optional[int]:
     if re.search(r"(鍵交換|キー交換|玄関[鍵錠]交換|鍵交換費|鍵交換料)", text):
         return money_from_text(text)
     return None
+
+
+def guess_building_type(structure_text: Optional[str], floors: Optional[int], bldg_name: Optional[str]) -> Optional[str]:
+    st = structure_text or ""
+    bn = bldg_name or ""
+    if "戸建" in bn or "一戸建" in bn:
+        return "戸建て"
+    if "鉄筋" in st or "RC" in st or (floors is not None and floors >= 3):
+        return "マンション"
+    if "木造" in st or (floors is not None and floors <= 2):
+        return "アパート"
+    return None
+
 
 def ensure_click(page, selector: str, timeout=5000):
     """Click if exists & visible; ignore otherwise."""
@@ -140,6 +159,7 @@ def ensure_click(page, selector: str, timeout=5000):
 # -----------------------------
 # Scraper
 # -----------------------------
+
 def scrape(url: str, headless: bool = True) -> Dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -150,13 +170,27 @@ def scrape(url: str, headless: bool = True) -> Dict:
         # ---------- HEADER ----------
         h1 = page.locator("h1.c-buildroom__summary-h").inner_text().strip()
         # e.g. プレディアコート錦糸町スカイビュー  2階２０１
-        building_name_ja = h1.split()[0]
+        # safer: take first line as building name
+        # Building name: remove trailing " <floor>階<unit>" if present (works even when on same line)
+        bn = re.sub(r"\s*\d+\s*階\s*[０-９0-9]+.*$", "", h1)
+        building_name_ja = bn.strip()
         floor_no = None
         unit_no = None
         m_h = re.search(r"(\d+)\s*階\s*([０-９0-9]+)", h1)
         if m_h:
             floor_no = num_from_text(m_h.group(1))
             unit_no = jpn_digits_to_ascii(m_h.group(2))
+
+        # property_csv_id & building id
+        property_csv_id = None
+        bld_cd = None
+        try:
+            btn = page.locator("button[data-code]").first
+            if btn.count():
+                property_csv_id = btn.get_attribute("data-code")
+                bld_cd = btn.get_attribute("data-bld_cd")
+        except Exception:
+            pass
 
         # ---------- SUMMARY BOX ----------
         def _dd_after_dt(dt_text: str) -> Optional[str]:
@@ -208,7 +242,7 @@ def scrape(url: str, headless: bool = True) -> Dict:
         structure_html = None
         try:
             structure_html = _dd_after_dt("規模構造")
-        except:
+        except Exception:
             structure_html = None
         structure_text = re.sub(r"<[^>]+>", "", structure_html or "").strip()
         structure = None
@@ -217,23 +251,32 @@ def scrape(url: str, headless: bool = True) -> Dict:
         if structure_text:
             # e.g. 鉄筋コンクリート造 地上14階建 / 地下1階
             mstruct = re.match(r"^(.+?造)", structure_text)
-            if mstruct: structure = mstruct.group(1)
+            if mstruct:
+                structure = mstruct.group(1)
             mf = re.search(r"地上\s*([0-9０-９]+)\s*階", structure_text)
-            if mf: floors = num_from_text(mf.group(1))
+            if mf:
+                floors = num_from_text(mf.group(1))
             mb = re.search(r"地下\s*([0-9０-９]+)\s*階", structure_text)
-            if mb: basement_floors = num_from_text(mb.group(1))
+            if mb:
+                basement_floors = num_from_text(mb.group(1))
 
-        # 入居可能日 / 更新料 / 駐車場 / 方位 / その他費用 / 設備 / 備考 / 情報更新日
+        # 入居可能日 / 更新料 / 駐車場 / 方位 / その他費用 / 設備 / 備考 / 情報更新日 / 取引態様 / 保険
         available_from = re.sub(r"<[^>]+>", "", _dd_after_dt("入居可能日") or "").strip() or None
         renewal_html = _dd_after_dt("更新料") or ""
         months_renewal = months_from_text(renewal_html)
         parking_text = re.sub(r"<[^>]+>", "", _dd_after_dt("駐車場") or "").strip()
-        parking = y_or_n("有" in parking_text)
+        parking_flag = y_or_n("有" in parking_text)
 
         facing_text = re.sub(r"<[^>]+>", "", _dd_after_dt("方位") or "").strip()
         facing_map = {
-            "北":"facing_north", "北東":"facing_northeast", "東":"facing_east", "南東":"facing_southeast",
-            "南":"facing_south", "南西":"facing_southwest", "西":"facing_west", "北西":"facing_northwest"
+            "北": "facing_north",
+            "北東": "facing_northeast",
+            "東": "facing_east",
+            "南東": "facing_southeast",
+            "南": "facing_south",
+            "南西": "facing_southwest",
+            "西": "facing_west",
+            "北西": "facing_northwest",
         }
         facing_flags = {v: "N" for v in facing_map.values()}
         for k, v in facing_map.items():
@@ -249,6 +292,25 @@ def scrape(url: str, headless: bool = True) -> Dict:
         building_desc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", _dd_after_dt("備考") or "").strip()) or None
         info_updated = re.sub(r"<[^>]+>", "", _dd_after_dt("情報更新日") or "").strip() or None
 
+        ad_type = re.sub(r"<[^>]+>", "", _dd_after_dt("取引態様") or "").strip() or None
+        fire_insurance = re.sub(r"<[^>]+>", "", _dd_after_dt("保険") or "").strip() or None
+
+        # Guarantor modal content (company list)
+        guarantor_agency_name = None
+        guarantor_agency = "N"
+        try:
+            body = page.locator("#guarantor .c-modal-content__body").inner_text()
+            companies = re.findall(r"【([^】]+)】", body)
+            if companies:
+                guarantor_agency_name = ", ".join(companies)
+                guarantor_agency = "Y"
+        except Exception:
+            pass
+
+        # Extra booleans from equipment/notes
+        motorcycle_parking = y_or_n("バイク置場" in equip_text)
+        aircon_flag = y_or_n(("エアコン" in equip_text) or ("ｴｱｺﾝ" in (building_desc or "")))
+
         # ---------- IMAGES ----------
         images: List[Tuple[str, str]] = []  # (category, url)
 
@@ -257,22 +319,17 @@ def scrape(url: str, headless: bool = True) -> Dict:
             main_src = page.locator(".c-buildroom__summary-pics img").first.get_attribute("src")
             if main_src:
                 images.append(("floorplan", main_src))
-        except:
+        except Exception:
             pass
 
-        # Interior (tab: 間取り・部屋) – usually already active, but click to ensure
+        # Interior (tab: 間取り・部屋)
         ensure_click(page, "button[data-js-buildroom-slide-tab='floorplan']")
-        # Thumbs live under c-buildroom-slide__thumbs
         try:
             page.wait_for_selector(".c-buildroom-slide__thumbs img", timeout=8000)
             for el in page.locator(".c-buildroom-slide__thumbs img").all():
                 src = el.get_attribute("src")
                 if src and ("nofloorplan.webp" not in src):
-                    if ("c.jpg" in src and "resized" in src) and ("floorplan" not in [c for c,_ in images]):
-                        # keep first c.jpg as floorplan (already added from main)
-                        pass
-                    else:
-                        images.append(("interior", src))
+                    images.append(("interior", src))
         except PWTimeout:
             pass
 
@@ -303,9 +360,35 @@ def scrape(url: str, headless: bool = True) -> Dict:
             image_fields[f"image_url_{idx}"] = url_i
 
         # ---------- Station lat/lng ----------
-        # The embedded map uses x/y (Japan plane rectangular). We don't convert to lat/lng here → set None.
         map_lat = None
         map_lng = None
+
+        # ---------- Try to enrich from Building page (postcode, maybe more) ----------
+        postcode = None
+        if bld_cd:
+            try:
+                bpage = context.new_page()
+                bpage.goto(f"https://www.mitsui-chintai.co.jp/rf/tatemono/{bld_cd}", wait_until="domcontentloaded", timeout=60000)
+                html = bpage.content()
+                mzip = re.search(r"〒\s*([0-9]{3}-?[0-9]{4})", html)
+                if mzip:
+                    # normalize to 123-4567
+                    zp = mzip.group(1)
+                    if "-" not in zp:
+                        postcode = f"{zp[:3]}-{zp[3:]}"
+                    else:
+                        postcode = zp
+                bpage.close()
+            except Exception:
+                pass
+
+        # ---------- Derivations ----------
+        building_type = guess_building_type(structure_text, floors, building_name_ja)
+
+        # numerics derived from months * rent (best-effort)
+        numeric_deposit = int(monthly_rent * months_deposit) if (monthly_rent and months_deposit) else None
+        numeric_key = int(monthly_rent * months_key) if (monthly_rent and months_key) else None
+        numeric_renewal = int(monthly_rent * months_renewal) if (monthly_rent and months_renewal) else None
 
         # ---------- Compose result ----------
         result = {k: None for k in [
@@ -344,6 +427,8 @@ def scrape(url: str, headless: bool = True) -> Dict:
         # Fill fields we have
         result.update({
             "link": url,
+            "property_csv_id": property_csv_id,
+            "postcode": postcode,
             "building_name_ja": building_name_ja,
             "floor_no": floor_no,
             "unit_no": unit_no,
@@ -364,20 +449,27 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "structure": structure,
             "floors": floors,
             "basement_floors": basement_floors,
-            "parking": y_or_n(parking == "Y"),
+            "parking": parking_flag,
             "available_from": available_from,
             "months_renewal": months_renewal,
             "map_lat": map_lat,
             "map_lng": map_lng,
             "building_description_ja": building_desc,
+            "building_notes": building_desc,
             "property_notes": building_desc,  # keep same as note field per guideline
             "property_other_expenses_ja": other_fee_text,
+            "other_initial_fees": other_fee_text,  # map as initial fees best-effort
             "lock_exchange": lock_exchange,
+            "ad_type": ad_type,
+            "fire_insurance": fire_insurance,
+            "guarantor_agency": guarantor_agency,
+            "guarantor_agency_name": guarantor_agency_name,
+            "no_guarantor": y_or_n(False),
             # facing flags
             **facing_flags,
             # features to flags
             **features,
-            # some obvious derived toggles
+            # some obvious derived toggles/flags
             "balcony": features.get("balcony", "N"),
             "bath": features.get("bath", "N"),
             "washing_machine": features.get("washing_machine", "N"),
@@ -391,16 +483,25 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "autolock": features.get("autolock", "N"),
             "delivery_box": features.get("delivery_box", "N"),
             "elevator": features.get("elevator", "N"),
+            "aircon": aircon_flag,
+            "motorcycle_parking": motorcycle_parking,
+            "building_type": building_type,
+            # renewal based on new rent wording
+            "renewal_new_rent": y_or_n(True) if months_renewal else None,
+            # derived numerics
+            "numeric_deposit": numeric_deposit,
+            "numeric_key": numeric_key,
+            "numeric_renewal": numeric_renewal,
             "create_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
+
         # mark newly built if "新築" flag shown near header
         try:
             new_flag = "新築" in page.locator(".c-buildroom__summary-flag").inner_text()
             result["newly_built"] = y_or_n(new_flag)
-        except:
+        except Exception:
             result["newly_built"] = "N"
 
-        # Numeric_renewal cannot be known (depends on rent). Keep None.
         # Images
         result.update(image_fields)
 
