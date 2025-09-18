@@ -1,27 +1,25 @@
 import re
 import json
 import argparse
+import contextlib
+import io
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
-
+import time
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
 JP_NUM = {"０":"0","１":"1","２":"2","３":"3","４":"4","５":"5","６":"6","７":"7","８":"8","９":"9"}
 
-
 def jpn_digits_to_ascii(s: str) -> str:
     return "".join(JP_NUM.get(ch, ch) for ch in s)
-
 
 def num_from_text(s: str) -> Optional[int]:
     s = jpn_digits_to_ascii(s)
     m = re.search(r"(-?\d+)", s)
     return int(m.group(1)) if m else None
-
 
 def money_from_text(s: str) -> Optional[int]:
     """Return integer amount in JPY if found (commas allowed)."""
@@ -31,68 +29,53 @@ def money_from_text(s: str) -> Optional[int]:
         return None
     return int(m.group(1).replace(",", ""))
 
-
 def months_from_text(s: str) -> Optional[float]:
     s = jpn_digits_to_ascii(s)
     m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*ヶ月", s)
     return float(m.group(1)) if m else None
 
-
 def y_or_n(flag: bool) -> str:
     return "Y" if flag else "N"
 
-
 def split_address(addr: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Very best-effort parsing for JP address: Prefecture / Ward-city / District / Chome-Banchi"""
+    """Best-effort parsing for JP address: Prefecture / Ward-city / District / Chome-Banchi"""
     if not addr:
         return None, None, None, None
-    # Prefecture is usually first token endswith 都/道/府/県
     m = re.match(r"^(.*?[都道府県])(.+)$", addr)
     if not m:
         return None, None, None, None
     prefecture, rest = m.group(1), m.group(2)
-    # Ward (区) or city (市)
     m2 = re.match(r"^(.*?[市区郡])(.*)$", rest)
     if not m2:
         return prefecture, None, None, None
     city = m2.group(1)
     tail = m2.group(2)
-
-    # District before 番/丁目/−… keep raw
     district = None
     chome_banchi = None
-    # e.g. 太平一丁目１２番4号  → district: 太平, chome_banchi: 一丁目１２番4号
     m3 = re.match(r"^(.+?)(\d.*|[一二三四五六七八九十]+\s*丁目.*)$", tail.strip())
     if m3:
         district = m3.group(1).strip(" ・")
         chome_banchi = m3.group(2).strip()
     else:
-        # fallback: split last whitespace
         parts = tail.strip().split()
         if len(parts) >= 2:
             district = parts[0]
             chome_banchi = " ".join(parts[1:])
         else:
             district = tail.strip()
-
     return prefecture, city, district, chome_banchi
 
-
 def parse_line_station_walk(html_block: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-    """Parse like: 'ＪＲ 総武線 錦糸町 徒歩9分'"""
-    # remove tags
+    """Parse phrase like: 'ＪＲ 総武線 錦糸町 徒歩9分'"""
     text = re.sub(r"<[^>]+>", " ", html_block or "")
     text = re.sub(r"\s+", " ", text).strip()
-    # find walk
     walk = None
     mw = re.search(r"徒歩\s*([0-9０-９]+)\s*分", text)
     if mw:
         walk = num_from_text(mw.group(1))
-    # line and station – take the last word before 徒歩 as station, previous token as line
     mls = re.search(r"(?:JR|ＪＲ)?\s*([^\s]+線)\s*([^\s]+)\s*徒歩", text)
     if mls:
         return mls.group(2), mls.group(1), walk
-    # fallback: take two tokens before 徒歩
     toks = text.split()
     if "徒歩" in toks:
         i = toks.index("徒歩")
@@ -101,7 +84,6 @@ def parse_line_station_walk(html_block: str) -> Tuple[Optional[str], Optional[st
             st = toks[i - 1]
             return st, line, walk
     return None, None, walk
-
 
 def extract_features_map(equip_text: str) -> Dict[str, str]:
     t = equip_text or ""
@@ -122,15 +104,13 @@ def extract_features_map(equip_text: str) -> Dict[str, str]:
     }
     return {k: y_or_n(v) for k, v in flags.items()}
 
-
 def pick_lock_exchange(text: str) -> Optional[int]:
-    """Find money for key/lock exchange only if present."""
+    """Find key/lock exchange fee only if present in the text."""
     if not text:
         return None
     if re.search(r"(鍵交換|キー交換|玄関[鍵錠]交換|鍵交換費|鍵交換料)", text):
         return money_from_text(text)
     return None
-
 
 def guess_building_type(structure_text: Optional[str], floors: Optional[int], bldg_name: Optional[str]) -> Optional[str]:
     st = structure_text or ""
@@ -143,7 +123,6 @@ def guess_building_type(structure_text: Optional[str], floors: Optional[int], bl
         return "アパート"
     return None
 
-
 def ensure_click(page, selector: str, timeout=5000):
     """Click if exists & visible; ignore otherwise."""
     try:
@@ -155,23 +134,158 @@ def ensure_click(page, selector: str, timeout=5000):
         pass
     return False
 
+def wait_for_network_idle(page, timeout_ms: int = 5000):
+    """Wait for network to be idle (no requests for 500ms)"""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except PWTimeout:
+        pass
+
+def activate_tab_and_wait_images_improved(page, tab: str, timeout_ms: int = 10000) -> bool:
+    """
+    Enhanced version with multiple strategies to ensure AJAX content loads
+    """
+    try:
+        print(f"Activating {tab} tab...")
+        thumbs_wrapper = page.locator(".c-buildroom-slide__thumbs .swiper-wrapper").first
+        initial_count = 0
+        try:
+            initial_count = thumbs_wrapper.locator("img").count()
+        except Exception:
+            pass
+        tab_button = page.locator(f"button[data-js-buildroom-slide-tab='{tab}']").first
+        if not tab_button or tab_button.count() == 0:
+            print(f"Tab button for {tab} not found")
+            return False
+        try:
+            tab_button.scroll_into_view_if_needed(timeout=3000)
+            tab_button.wait_for(state="visible", timeout=3000)
+        except PWTimeout:
+            print(f"Tab button for {tab} not visible")
+            pass
+        try:
+            tab_button.click(timeout=5000)
+            print(f"Clicked {tab} tab button")
+        except PWTimeout:
+            print(f"Failed to click {tab} tab button")
+            return False
+        time.sleep(0.5)
+        try:
+            page.wait_for_function(
+                """(button) => {
+                    return button && button.classList.contains('--is-active');
+                }""",
+                arg=tab_button.element_handle(),
+                timeout=3000
+            )
+            print(f"{tab} tab became active")
+        except PWTimeout:
+            print(f"{tab} tab did not become active (might still work)")
+            pass
+        wait_for_network_idle(page, 3000)
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                current_count = thumbs_wrapper.locator("img").count()
+                images = thumbs_wrapper.locator("img").all()
+                valid_images = []
+                for img in images:
+                    try:
+                        src = img.get_attribute("src")
+                        if src and "nofloorplan.webp" not in src:
+                            valid_images.append(src)
+                    except Exception:
+                        continue
+                if valid_images:
+                    print(f"Found {len(valid_images)} valid images in {tab} tab")
+                    return True
+                if attempt < max_attempts - 1:
+                    print(f"Attempt {attempt + 1}: Waiting for {tab} images to load...")
+                    time.sleep(1)
+            except Exception as e:
+                print(f"Error checking images on attempt {attempt + 1}: {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+        try:
+            main_images = page.locator(".c-buildroom__summary-pics img").all()
+            for img in main_images:
+                try:
+                    src = img.get_attribute("src")
+                    if src and "nofloorplan.webp" not in src:
+                        print(f"Found image in main slide: {src}")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        print(f"No valid images found for {tab} tab")
+        return False
+    except Exception as e:
+        print(f"Error in activate_tab_and_wait_images_improved for {tab}: {e}")
+        return False
+
+def collect_current_imgs_improved(page) -> List[str]:
+    """
+    Enhanced image collection with better error handling, restricted to c-buildroom
+    """
+    urls = set()
+    # Restrict selectors to c-buildroom scope only
+    selectors = [
+        ".c-buildroom .c-buildroom-slide__thumbs img",
+        ".c-buildroom .c-buildroom__summary-pics img",
+        ".c-buildroom .c-buildroom-slide__main img"
+    ]
+    for selector in selectors:
+        try:
+            images = page.locator(selector).all()
+            print(f"Found {len(images)} images with selector: {selector}")
+            for img in images:
+                try:
+                    src = img.get_attribute("src")
+                    if src and "nofloorplan.webp" not in src and src.startswith("http"):
+                        urls.add(src)
+                        print(f"Added image URL: {src}")
+                except Exception as e:
+                    print(f"Error getting src from image: {e}")
+                    continue
+        except Exception as e:
+            print(f"Error with selector {selector}: {e}")
+            continue
+    print(f"Total unique image URLs collected: {len(urls)}")
+    return list(urls)
+
+def is_floorplan_url(src: str) -> bool:
+    """
+    Heuristic: on this site floorplan images often end with '...c.jpg' under /rf/resized/ path
+    or contain the word 'floorplan' in URL.
+    """
+    if not src:
+        return False
+    if "floorplan" in src.lower():
+        return True
+    return bool(re.search(r"/resized/[^/]+/[^/]*c\.jpg$", src))
 
 # -----------------------------
-# Scraper
+# Scraper with improved image handling
 # -----------------------------
 
 def scrape(url: str, headless: bool = True) -> Dict:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         context = browser.new_context()
+        def log_request(request):
+            if "ajax" in request.url.lower() or "api" in request.url.lower():
+                print(f"AJAX Request: {request.url}")
+        def log_response(response):
+            if "ajax" in response.url.lower() or "api" in response.url.lower():
+                print(f"AJAX Response: {response.url} - Status: {response.status}")
         page = context.new_page()
+        page.on("request", log_request)
+        page.on("response", log_response)
+        print(f"Loading page: {url}")
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
-
-        # ---------- HEADER ----------
+        time.sleep(2)
         h1 = page.locator("h1.c-buildroom__summary-h").inner_text().strip()
-        # e.g. プレディアコート錦糸町スカイビュー  2階２０１
-        # safer: take first line as building name
-        # Building name: remove trailing " <floor>階<unit>" if present (works even when on same line)
         bn = re.sub(r"\s*\d+\s*階\s*[０-９0-9]+.*$", "", h1)
         building_name_ja = bn.strip()
         floor_no = None
@@ -180,8 +294,6 @@ def scrape(url: str, headless: bool = True) -> Dict:
         if m_h:
             floor_no = num_from_text(m_h.group(1))
             unit_no = jpn_digits_to_ascii(m_h.group(2))
-
-        # property_csv_id & building id
         property_csv_id = None
         bld_cd = None
         try:
@@ -191,35 +303,24 @@ def scrape(url: str, headless: bool = True) -> Dict:
                 bld_cd = btn.get_attribute("data-bld_cd")
         except Exception:
             pass
-
-        # ---------- SUMMARY BOX ----------
         def _dd_after_dt(dt_text: str) -> Optional[str]:
             dt = page.locator(f"//dt[normalize-space()='{dt_text}']")
             if dt.count() == 0:
                 return None
             dd = dt.nth(0).locator("xpath=following-sibling::dd[1]")
             return dd.inner_html().strip() if dd.count() else None
-
         address_html = _dd_after_dt("所在地")
         address = re.sub(r"<[^>]+>", "", address_html or "").strip() if address_html else None
         prefecture, city, district, chome_banchi = split_address(address or "")
-
-        # Access / Transportation (first entry)
         access_html = _dd_after_dt("交通") or ""
         st1, line1, walk1 = parse_line_station_walk(access_html)
-
-        # 賃料・管理費・共益費
         rent_html = _dd_after_dt("賃料・管理費・共益費") or ""
         monthly_rent = money_from_text(rent_html)
         mtn_m = re.search(r"/\s*([0-9,０-９]+円)", rent_html)
         monthly_maintenance = money_from_text(mtn_m.group(1)) if mtn_m else None
-
-        # 敷金／礼金
         depkey_html = _dd_after_dt("敷金／礼金") or ""
         months_deposit = months_from_text(depkey_html)
         months_key = months_from_text(depkey_html.split("/")[-1]) if "/" in depkey_html else None
-
-        # 間取り・面積
         layout_html = _dd_after_dt("間取り・面積") or ""
         room_type = None
         size = None
@@ -229,16 +330,11 @@ def scrape(url: str, headless: bool = True) -> Dict:
         m_size = re.search(r"([0-9.]+)\s*㎡", layout_html)
         if m_size:
             size = float(m_size.group(1))
-
-        # Completion date → extract year only
         built_html = _dd_after_dt("竣工日") or ""
         year = None
         my = re.search(r"([0-9]{4})年", built_html)
         if my:
             year = int(my.group(1))
-
-        # ---------- DETAIL TABLE ----------
-        # Scale / Structure section
         structure_html = None
         try:
             structure_html = _dd_after_dt("規模構造")
@@ -249,7 +345,6 @@ def scrape(url: str, headless: bool = True) -> Dict:
         floors = None
         basement_floors = None
         if structure_text:
-            # e.g. 鉄筋コンクリート造 地上14階建 / 地下1階
             mstruct = re.match(r"^(.+?造)", structure_text)
             if mstruct:
                 structure = mstruct.group(1)
@@ -259,14 +354,11 @@ def scrape(url: str, headless: bool = True) -> Dict:
             mb = re.search(r"地下\s*([0-9０-９]+)\s*階", structure_text)
             if mb:
                 basement_floors = num_from_text(mb.group(1))
-
-        # Available from / Renewal fee / Parking / Orientation / Other fees / Equipment / Notes / Info updated / Transaction type / Insurance
         available_from = re.sub(r"<[^>]+>", "", _dd_after_dt("入居可能日") or "").strip() or None
         renewal_html = _dd_after_dt("更新料") or ""
         months_renewal = months_from_text(renewal_html)
         parking_text = re.sub(r"<[^>]+>", "", _dd_after_dt("駐車場") or "").strip()
         parking_flag = y_or_n("有" in parking_text)
-
         facing_text = re.sub(r"<[^>]+>", "", _dd_after_dt("方位") or "").strip()
         facing_map = {
             "北": "facing_north",
@@ -282,20 +374,14 @@ def scrape(url: str, headless: bool = True) -> Dict:
         for k, v in facing_map.items():
             if k in facing_text:
                 facing_flags[v] = "Y"
-
         other_fee_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", _dd_after_dt("その他費用") or "").strip())
         lock_exchange = pick_lock_exchange(other_fee_text)
-
         equip_text = re.sub(r"<[^>]+>", "", _dd_after_dt("専有部・共用部設備") or "").strip()
         features = extract_features_map(equip_text)
-
         building_desc = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", _dd_after_dt("備考") or "").strip()) or None
         info_updated = re.sub(r"<[^>]+>", "", _dd_after_dt("情報更新日") or "").strip() or None
-
         ad_type = re.sub(r"<[^>]+>", "", _dd_after_dt("取引態様") or "").strip() or None
         fire_insurance = re.sub(r"<[^>]+>", "", _dd_after_dt("保険") or "").strip() or None
-
-        # Guarantor modal content (company list)
         guarantor_agency_name = None
         guarantor_agency = "N"
         try:
@@ -306,64 +392,55 @@ def scrape(url: str, headless: bool = True) -> Dict:
                 guarantor_agency = "Y"
         except Exception:
             pass
-
-        # Extra booleans from equipment/notes
         motorcycle_parking = y_or_n("バイク置場" in equip_text)
         aircon_flag = y_or_n(("エアコン" in equip_text) or ("ｴｱｺﾝ" in (building_desc or "")))
-
-        # ---------- IMAGES ----------
-        images: List[Tuple[str, str]] = []  # (category, url)
-
-        # Floorplan in main image (if present)
+        print("Starting image collection...")
+        cat_priority = {"exterior": 0, "interior": 1, "floorplan": 2}
+        url_index: Dict[str, int] = {}
+        final_images: List[Tuple[str, str]] = []
+        print("Collecting floorplan images...")
+        floorplan_urls: List[str] = []
+        if activate_tab_and_wait_images_improved(page, "floorplan"):
+            floorplan_urls = collect_current_imgs_improved(page)
+            print(f"Found {len(floorplan_urls)} floorplan URLs")
+        for src in floorplan_urls:
+            cat = "floorplan" if is_floorplan_url(src) else "interior"
+            if src in url_index:
+                idx = url_index[src]
+                if cat_priority[cat] > cat_priority[final_images[idx][0]]:
+                    final_images[idx] = (cat, src)
+            else:
+                url_index[src] = len(final_images)
+                final_images.append((cat, src))
+        print("Collecting exterior images...")
+        exterior_urls: List[str] = []
+        if activate_tab_and_wait_images_improved(page, "exterior"):
+            exterior_urls = collect_current_imgs_improved(page)
+            print(f"Found {len(exterior_urls)} exterior URLs")
+        for src in exterior_urls:
+            if src in url_index:
+                continue
+            url_index[src] = len(final_images)
+            final_images.append(("exterior", src))
+        print("Fallback image collection...")
         try:
-            main_src = page.locator(".c-buildroom__summary-pics img").first.get_attribute("src")
-            if main_src:
-                images.append(("floorplan", main_src))
-        except Exception:
-            pass
-
-        # Interior (site tab label '間取り・部屋' – Floorplan/Rooms)
-        ensure_click(page, "button[data-js-buildroom-slide-tab='floorplan']")
-        try:
-            page.wait_for_selector(".c-buildroom-slide__thumbs img", timeout=8000)
-            for el in page.locator(".c-buildroom-slide__thumbs img").all():
-                src = el.get_attribute("src")
-                if src and ("nofloorplan.webp" not in src):
-                    images.append(("interior", src))
-        except PWTimeout:
-            pass
-
-        # Exterior / Common areas / Neighborhood (site tab label '外観・共用部・周辺')
-        if ensure_click(page, "button[data-js-buildroom-slide-tab='exterior']", timeout=8000):
-            try:
-                page.wait_for_selector(".c-buildroom-slide__thumbs img", timeout=12000)
-                for el in page.locator(".c-buildroom-slide__thumbs img").all():
-                    src = el.get_attribute("src")
-                    if src and ("nofloorplan.webp" not in src):
-                        images.append(("exterior", src))
-            except PWTimeout:
-                pass
-
-        # Deduplicate while keeping order
-        seen = set()
-        uniq_imgs = []
-        for cat, url_i in images:
-            key = (cat, url_i)
-            if url_i and key not in seen:
-                uniq_imgs.append((cat, url_i))
-                seen.add(key)
-
-        # Map to image_category_1.. and image_url_1..
+            fallback_urls = collect_current_imgs_improved(page)
+            for src in fallback_urls:
+                if src not in url_index:
+                    cat = "floorplan" if is_floorplan_url(src) else "interior"
+                    url_index[src] = len(final_images)
+                    final_images.append((cat, src))
+        except Exception as e:
+            print(f"Error in fallback collection: {e}")
+        print(f"Total images collected: {len(final_images)}")
+        for i, (cat, url_i) in enumerate(final_images):
+            print(f"  {i+1}: {cat} - {url_i}")
         image_fields = {}
-        for idx, (cat, url_i) in enumerate(uniq_imgs[:16], start=1):
+        for idx, (cat, url_i) in enumerate(final_images[:16], start=1):
             image_fields[f"image_category_{idx}"] = cat
             image_fields[f"image_url_{idx}"] = url_i
-
-        # ---------- Station lat/lng ----------
         map_lat = None
         map_lng = None
-
-        # ---------- Try to enrich from Building page (postcode, maybe more) ----------
         postcode = None
         if bld_cd:
             try:
@@ -372,7 +449,6 @@ def scrape(url: str, headless: bool = True) -> Dict:
                 html = bpage.content()
                 mzip = re.search(r"〒\s*([0-9]{3}-?[0-9]{4})", html)
                 if mzip:
-                    # normalize to 123-4567
                     zp = mzip.group(1)
                     if "-" not in zp:
                         postcode = f"{zp[:3]}-{zp[3:]}"
@@ -381,18 +457,11 @@ def scrape(url: str, headless: bool = True) -> Dict:
                 bpage.close()
             except Exception:
                 pass
-
-        # ---------- Derivations ----------
         building_type = guess_building_type(structure_text, floors, building_name_ja)
-
-        # numerics derived from months * rent (best-effort)
         numeric_deposit = int(monthly_rent * months_deposit) if (monthly_rent and months_deposit) else None
         numeric_key = int(monthly_rent * months_key) if (monthly_rent and months_key) else None
         numeric_renewal = int(monthly_rent * months_renewal) if (monthly_rent and months_renewal) else None
-
-        # ---------- Compose result ----------
         result = {k: None for k in [
-            # all keys (init to None). We fill the ones we have:
             "link","property_csv_id","postcode","prefecture","city","district","chome_banchi",
             "building_type","year","building_name_en","building_name_ja","building_name_zh_CN","building_name_zh_TW",
             "building_description_en","building_description_ja","building_description_zh_CN","building_description_zh_TW",
@@ -423,8 +492,6 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "underfloor_heating","unit_bath","utensils_cutlery","veranda","washer_dryer","washing_machine","washlet",
             "western_toilet","yard","youtube","vr_link","numeric_guarantor_max","discount","create_date"
         ]}
-
-        # Fill fields we have
         result.update({
             "link": url,
             "property_csv_id": property_csv_id,
@@ -456,20 +523,17 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "map_lng": map_lng,
             "building_description_ja": building_desc,
             "building_notes": building_desc,
-            "property_notes": building_desc,  # keep same as note field per guideline
+            "property_notes": building_desc,
             "property_other_expenses_ja": other_fee_text,
-            "other_initial_fees": other_fee_text,  # map as initial fees best-effort
+            "other_initial_fees": other_fee_text,
             "lock_exchange": lock_exchange,
             "ad_type": ad_type,
             "fire_insurance": fire_insurance,
             "guarantor_agency": guarantor_agency,
             "guarantor_agency_name": guarantor_agency_name,
             "no_guarantor": y_or_n(False),
-            # facing flags
             **facing_flags,
-            # features to flags
             **features,
-            # some obvious derived toggles/flags
             "balcony": features.get("balcony", "N"),
             "bath": features.get("bath", "N"),
             "washing_machine": features.get("washing_machine", "N"),
@@ -486,38 +550,38 @@ def scrape(url: str, headless: bool = True) -> Dict:
             "aircon": aircon_flag,
             "motorcycle_parking": motorcycle_parking,
             "building_type": building_type,
-            # renewal based on new rent wording
             "renewal_new_rent": y_or_n(True) if months_renewal else None,
-            # derived numerics
             "numeric_deposit": numeric_deposit,
             "numeric_key": numeric_key,
             "numeric_renewal": numeric_renewal,
             "create_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
-
-        # Mark as newly built if the '新築' (newly built) flag appears n
         try:
             new_flag = "新築" in page.locator(".c-buildroom__summary-flag").inner_text()
             result["newly_built"] = y_or_n(new_flag)
         except Exception:
             result["newly_built"] = "N"
-
-        # Images
         result.update(image_fields)
-
         browser.close()
         return result
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True, help="Property URL")
     parser.add_argument("--headful", action="store_true", help="Run with browser UI")
+    parser.add_argument("--verbose", action="store_true", help="Show internal logs")
     args = parser.parse_args()
 
-    data = scrape(args.url, headless=not args.headful)
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    # Khi không verbose: ẩn toàn bộ log trong quá trình scrape
+    if args.verbose:
+        data = scrape(args.url, headless=not args.headful)
+    else:
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            data = scrape(args.url, headless=not args.headful)
 
+    # Chỉ in ra JSON cuối cùng
+    print(json.dumps(data, ensure_ascii=False, indent=2))
 
 if __name__ == "__main__":
     main()
